@@ -13,7 +13,7 @@
 
 ## Descripción General
 
-Este proyecto implementa un ecosistema **AIoT (Artificial Intelligence of Things)** modular y escalable diseñado para el monitoreo en tiempo real de variables críticas (temperatura y corriente) en motores industriales.  
+Este proyecto implementa un ecosistema **IoT (Internet of Things)** modular y escalable diseñado para el monitoreo en tiempo real de variables críticas (temperatura y corriente) en motores industriales.  
 Reemplaza soluciones SCADA propietarias mediante una arquitectura *cloud-native* basada completamente en tecnologías abiertas.
 
 El flujo de datos abarca desde la adquisición física mediante acondicionamiento de señales Edge hasta el procesamiento, almacenamiento y visualización en la nube usando **Docker, Flask, MongoDB y Grafana** desplegados en **Render**.
