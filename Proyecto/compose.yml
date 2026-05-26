@@ -1,73 +1,180 @@
+#version: '3.8'
 
 services:
+  # ============================
+  # MOSQUITTO MQTT BROKER
+  # ============================
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: proyecto-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"      # Puerto MQTT
+      - "9001:9001"      # Puerto WebSocket
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+      - ./mosquitto/passwd:/mosquitto/config/passwd  # Archivo de contraseñas
+    networks:
+      - app-network
+    command: >
+      sh -c "
+      mosquitto_passwd -b /mosquitto/config/passwd esp32_client iot2025secure &&
+      exec /usr/sbin/mosquitto -c /mosquitto/config/mosquitto.conf
+      "
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-u", "esp32_client", "-P", "iot2025secure", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ============================
+  # MONGODB
+  # ============================
+  mongo:
+    image: mongo:latest
+    container_name: proyecto-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: proyecto_db
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+    networks:
+      - app-network
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ============================
+  # MONGO EXPRESS (Interfaz Web)
+  # ============================
+  mongo-express:
+    image: mongo-express:latest
+    container_name: proyecto-mongo-express
+    restart: unless-stopped
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: admin
+      ME_CONFIG_MONGODB_ADMINPASSWORD: admin123
+      ME_CONFIG_MONGODB_URL: mongodb://admin:admin123@mongo:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin123
+    ports:
+      - "8081:8081"
+    depends_on:
+      - mongo
+    networks:
+      - app-network
+
+  # ============================
+  # FLASK BACKEND (con MQTT Handler)
+  # ============================
   web:
     build:
       context: ./src
-      dockerfile: dockerfile
+      dockerfile: Dockerfile
+    container_name: proyecto-web
+    restart: unless-stopped
     ports:
       - "5001:5001"
+    environment:
+      # MongoDB
+      MONGO_URI: mongodb://admin:admin123@mongo:27017/proyecto_db?authSource=admin
+      
+      # MQTT Configuration
+      MQTT_BROKER: mosquitto
+      MQTT_PORT: 1883
+      MQTT_USERNAME: esp32_client
+      MQTT_PASSWORD: iot2025secure
+      MQTT_CLIENT_ID: flask_backend_01
+      
+      # Grafana
+      GRAFANA_EMBED_URL: http://localhost:3000/public-dashboards/65fe92bf244e40dbb7d0e1efd4e4142b?orgId=1&kiosk
+      
+      # Flask
+      FLASK_ENV: production
+      FLASK_DEBUG: 0
     volumes:
-      - "./src:/app/src"
-    environment:
-        - MONGO_URI=${MONGO_URI}
-      # - MONGO_HOST=mongo
-      # - MONGO_PORT=27017
-      # - MONGO_DB=proyecto_db
-      # - MONGO_USER=admin
-      # - MONGO_PASSWORD=admin123
+      - ./src:/app
     depends_on:
-      - mongo
-    networks:
-     - app-networks
-  
-  mongo:
-    image: mongo:latest
-    ports:
-      - "27017:27017"
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=admin
-      - MONGO_INITDB_ROOT_PASSWORD=admin123
-      - MONGO_INITDB_DATABASE=proyecto_db
-    volumes:
-      - mongo-data:/data/db
-    networks:
-     - app-networks
+      mongo:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
 
-  mongo-express:
-    image: mongo-express:latest
-    ports:
-      - "8081:8081"
-    environment:
-      - ME_CONFIG_MONGODB_ADMINUSERNAME=admin
-      - ME_CONFIG_MONGODB_ADMINPASSWORD=admin123
-      - ME_CONFIG_MONGODB_SERVER=mongo
-      - ME_CONFIG_MONGODB_PORT=27017
-      - ME_CONFIG_MONGODB_AUTH_DATABASE=admin
-    depends_on:
-      - mongo
     networks:
-     - app-networks
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
+  # ============================
+  # GRAFANA
+  # ============================
   grafana:
     image: grafana/grafana-oss:latest
+    container_name: proyecto-grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
+    environment:
+      # Seguridad
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      
+      # Autenticación anónima (para dashboard público)
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Editor
+      
+      # Plugins
+      GF_INSTALL_PLUGINS: simpod-json-datasource,yesoreyeram-infinity-datasource
+      
+      # Base URL
+      GF_SERVER_ROOT_URL: http://localhost:3000
+      GF_SERVER_DOMAIN: localhost
     volumes:
       - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning  # Auto-provisioning
+    depends_on:
+      web:
+        condition: service_healthy
     networks:
-      - app-networks
-    restart: unless-stopped
-    environment:
-      - GF_SECURITY_ALLOW_EMBEDDING=true
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Editor
-      - GF_INSTALL_PLUGINS=simpod-json-datasource
-      # - GF_SECURITY_COOKIE_SAMESITE=none    
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
+# ============================
+# NETWORKS
+# ============================
 networks:
-  app-networks:
+  app-network:
     driver: bridge
+    name: cms_network
 
+# ============================
+# VOLUMES
+# ============================
 volumes:
   mongo-data:
+    driver: local
+  mongo-config:
+    driver: local
   grafana-data:
+    driver: local

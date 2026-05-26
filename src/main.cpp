@@ -1,41 +1,78 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
+#include <PubSubClient.h>  // MQTT Client
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include "EmonLib.h"
 #include "ESP_Mail_Client.h"
 
-// --- 1. CONFIGURACIÓN DE RED Y SERVIDOR ---
+// ============================================
+// CONFIGURACIÓN DE RED
+// ============================================
 const char* ssid = "POCO X7 Pro";
-const char* password = "**********.";
-const char* serverUrl = "https://iotadvancedprgm.onrender.com/receive_sensor_data"; 
+const char* password = "12345678.";
 
-// --- Mail Configuration ---
+// ============================================
+// CONFIGURACIÓN MQTT
+// ============================================
+const char* mqtt_server = "iotadvancedprgm.onrender.com";  // Tu servidor
+const int mqtt_port = 1883;
+const char* mqtt_user = "esp32_client";     // Usuario MQTT
+const char* mqtt_password = "iot2025secure"; // Password MQTT
+const char* mqtt_client_id = "ESP32_CMS_01"; // ID único
+
+// Topics MQTT (estructura jerárquica)
+const char* topic_temperature = "cms/sensors/temperature";
+const char* topic_current = "cms/sensors/current";
+const char* topic_status = "cms/device/status";
+const char* topic_alerts = "cms/alerts";
+
+// ============================================
+// CONFIGURACIÓN EMAIL
+// ============================================
 #define emailSenderAccount    "iotsensors74@gmail.com"
 #define emailSenderPassword   "**************"
 #define smtpServer            "smtp.gmail.com"
 #define smtpServerPort        465
-
-// --- Mail Recipient ---
 String inputMessage = "karojg24@gmail.com";
 
+// ============================================
+// UMBRALES DE ALERTA
+// ============================================
 const float TEMP_THRESHOLD = 25.0;
 const float CURRENT_THRESHOLD = 0.3;
 
-// --- VARIABLES COMPARTIDAS ---
+// ============================================
+// PINES Y CALIBRACIÓN
+// ============================================
+#define ONE_WIRE_BUS 4
+#define CURRENT_SENSOR_PIN 17
+
+const float CALIBRATION_FACTOR = 5.51;
+const float NOISE_THRESHOLD = 0.10;
+float adcOffset = 0.0;
+
+// ============================================
+// INSTANCIAS
+// ============================================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);  // Cliente MQTT
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+EnergyMonitor emon1;
+
+// ============================================
+// VARIABLES COMPARTIDAS
+// ============================================
 float currentTemp = 0.0;
 float currentCurrent = 0.0;
 bool emailSent = false;
 
-// Mutex para proteger acceso a variables compartidas
 SemaphoreHandle_t xMutex;
-
-// Colas para comunicación entre tareas
 QueueHandle_t emailQueue;
 
-// Estructura para alertas de correo
 struct EmailAlert {
   char sensor[20];
   float value;
@@ -43,52 +80,196 @@ struct EmailAlert {
   float threshold;
 };
 
-// --- 2. PINES Y CALIBRACIÓN ---
-#define ONE_WIRE_BUS 4
-#define CURRENT_SENSOR_PIN 17
-
-// Calibración ajustada para SCT-013
-const float CALIBRATION_FACTOR = 5.51;
-
-// Umbral de ruido: valores menores se consideran 0
-const float NOISE_THRESHOLD = 0.10;  // Ajusta según tu sensor
-
-// Offset del ADC (se calibra en setup)
-float adcOffset = 0.0; 
-
-// --- 3. INSTANCIAS ---
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
-EnergyMonitor emon1;
-
-// --- DECLARACIÓN DE FUNCIONES ---
-void smtpCallback(SMTP_Status status);
+// ============================================
+// PROTOTIPOS DE FUNCIONES
+// ============================================
+void setupWiFi();
+void reconnectMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void publishSensorData(const char* topic, const char* sensor_name, float value, const char* unit);
+void publishStatus();
+float calibrateADCOffset(int samples = 1000);
+float readCurrent();
 void sendAlertEmail(const char* sensor, float value, const char* unit, float threshold);
-void sendDataToFlask(const char* sensor_name, float value, const char* unit);
+void smtpCallback(SMTP_Status status);
 
-// --- CALLBACK SMTP ---
-void smtpCallback(SMTP_Status status) {
-  Serial.println(status.info());
-  if (status.success()) {
-    Serial.println("✓ Email enviado exitosamente");
-    Serial.println("----------------");
+// ============================================
+// SETUP WIFI
+// ============================================
+void setupWiFi() {
+  delay(10);
+  Serial.println("\n[WiFi] Conectando a " + String(ssid));
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] ✓ Conectado!");
+    Serial.print("[WiFi] IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WiFi] ✗ Fallo en conexión");
   }
 }
 
-// --- FUNCIÓN DE ENVÍO DE CORREO ---
+// ============================================
+// MQTT CALLBACK (mensajes entrantes)
+// ============================================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("[MQTT] Mensaje recibido en topic: ");
+  Serial.println(topic);
+  
+  // Convertir payload a string
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print("[MQTT] Contenido: ");
+  Serial.println(message);
+  
+  // Aquí puedes procesar comandos remotos si los necesitas
+  // Ejemplo: cambiar umbrales dinámicamente
+}
+
+// ============================================
+// RECONNECT MQTT
+// ============================================
+void reconnectMQTT() {
+  // Loop hasta conectar
+  while (!mqttClient.connected()) {
+    Serial.print("[MQTT] Intentando conexión...");
+    
+    // Intento de conexión con credenciales
+    if (mqttClient.connect(mqtt_client_id, mqtt_user, mqtt_password)) {
+      Serial.println(" ✓ Conectado!");
+      
+      // Suscribirse a topics de comandos (opcional)
+      mqttClient.subscribe("cms/commands/#");
+      
+      // Publicar estado inicial
+      publishStatus();
+      
+    } else {
+      Serial.print(" ✗ Falló, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Reintentando en 5s...");
+      delay(5000);
+    }
+  }
+}
+
+// ============================================
+// PUBLICAR DATOS DE SENSOR VÍA MQTT
+// ============================================
+void publishSensorData(const char* topic, const char* sensor_name, float value, const char* unit) {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  
+  // Crear JSON compacto
+  StaticJsonDocument<200> doc;
+  doc["sensor"] = sensor_name;
+  doc["value"] = value;
+  doc["unit"] = unit;
+  doc["timestamp"] = millis();
+  
+  char buffer[256];
+  serializeJson(doc, buffer);
+  
+  // Publicar con QoS 1 (al menos una vez)
+  bool published = mqttClient.publish(topic, buffer, true); // retained=true
+  
+  if (published) {
+    Serial.printf("[MQTT] ✓ Publicado en %s: %s\n", topic, buffer);
+  } else {
+    Serial.printf("[MQTT] ✗ Error publicando en %s\n", topic);
+  }
+}
+
+// ============================================
+// PUBLICAR ESTADO DEL DISPOSITIVO
+// ============================================
+void publishStatus() {
+  StaticJsonDocument<200> doc;
+  doc["device"] = mqtt_client_id;
+  doc["status"] = "online";
+  doc["uptime"] = millis() / 1000;
+  doc["rssi"] = WiFi.RSSI();
+  
+  char buffer[256];
+  serializeJson(doc, buffer);
+  
+  mqttClient.publish(topic_status, buffer, true);
+  Serial.println("[MQTT] Estado publicado");
+}
+
+// ============================================
+// CALIBRACIÓN ADC
+// ============================================
+float calibrateADCOffset(int samples) {
+  Serial.println("\n[CALIBRACIÓN] Midiendo offset del ADC...");
+  Serial.println("[CALIBRACIÓN] NO debe haber corriente en el sensor");
+  
+  delay(2000);
+  
+  long sum = 0;
+  for(int i = 0; i < samples; i++) {
+    sum += analogRead(CURRENT_SENSOR_PIN);
+    delayMicroseconds(100);
+  }
+  
+  float offset = sum / (float)samples;
+  Serial.printf("[CALIBRACIÓN] Offset: %.2f (%.3fV)\n", offset, (offset/4095.0)*3.3);
+  
+  return offset;
+}
+
+// ============================================
+// LEER CORRIENTE RMS
+// ============================================
+float readCurrent() {
+  double Irms = emon1.calcIrms(1480);
+  
+  if (Irms < NOISE_THRESHOLD) {
+    return 0.0;
+  }
+  
+  return Irms;
+}
+
+// ============================================
+// SMTP CALLBACK
+// ============================================
+void smtpCallback(SMTP_Status status) {
+  Serial.println(status.info());
+  if (status.success()) {
+    Serial.println("[EMAIL] ✓ Enviado exitosamente");
+  }
+}
+
+// ============================================
+// ENVIAR ALERTA POR EMAIL
+// ============================================
 void sendAlertEmail(const char* sensor, float value, const char* unit, float threshold) {
-  Serial.println("\n=== [CORE 0] INICIANDO ENVIO DE CORREO ===");
+  Serial.println("\n=== [CORE 0] ENVIANDO EMAIL ===");
   
   SMTPSession smtp;
-  
   ESP_Mail_Session session;
+  
   session.server.host_name = smtpServer;
   session.server.port = smtpServerPort;
   session.login.email = emailSenderAccount;
   session.login.password = emailSenderPassword;
-  session.login.user_domain = "";
   
-  session.time.ntp_server = F("pool.ntp.org,time.nist.gov");
+  session.time.ntp_server = F("pool.ntp.org");
   session.time.gmt_offset = -5;
   session.time.day_light_offset = 0;
   
@@ -100,166 +281,104 @@ void sendAlertEmail(const char* sensor, float value, const char* unit, float thr
   message.sender.email = emailSenderAccount;
   message.addRecipient(F("Usuario"), inputMessage);
   
-  String subj = "[ALERTA] Umbral de ";
-  subj += sensor;
-  subj += " superado!";
+  String subj = "[ALERTA] " + String(sensor) + " superó umbral!";
   message.subject = subj;
   
-  String alertBody = "ALERTA DE SENSOR\n\n";
-  alertBody += "Sensor: ";
-  alertBody += String(sensor);
-  alertBody += "\n";
-  alertBody += "Umbral configurado: ";
-  alertBody += String(threshold, 2);
-  alertBody += " ";
-  alertBody += String(unit);
-  alertBody += "\n";
-  alertBody += "Valor actual: ";
-  alertBody += String(value, 2);
-  alertBody += " ";
-  alertBody += String(unit);
-  alertBody += "\n\n";
-  alertBody += "Timestamp: ";
-  alertBody += String(millis() / 1000);
-  alertBody += " segundos\n";
-  alertBody += "\n--- ESP32 IoT System ---";
-
-  message.text.content = alertBody.c_str();
+  String body = "ALERTA DE SENSOR\n\n";
+  body += "Sensor: " + String(sensor) + "\n";
+  body += "Umbral: " + String(threshold, 2) + " " + String(unit) + "\n";
+  body += "Valor actual: " + String(value, 2) + " " + String(unit) + "\n\n";
+  body += "Timestamp: " + String(millis()/1000) + "s\n";
+  body += "\n--- ESP32 CMS System ---";
+  
+  message.text.content = body.c_str();
   message.text.charSet = F("utf-8");
   message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
   message.priority = esp_mail_smtp_priority::esp_mail_smtp_priority_high;
-
-  Serial.println("[CORE 0] Conectando al servidor SMTP...");
+  
   if (!smtp.connect(&session)) {
-    Serial.println("[CORE 0] ✗ Error al conectar con servidor SMTP");
-    Serial.printf("Razón: %s\n", smtp.errorReason().c_str());
+    Serial.println("[EMAIL] ✗ Error conectando SMTP");
     return;
   }
   
-  Serial.println("[CORE 0] Enviando correo...");
   if (!MailClient.sendMail(&smtp, &message)) {
-    Serial.println("[CORE 0] ✗ Error al enviar correo");
-    Serial.printf("Razón: %s\n", smtp.errorReason().c_str());
+    Serial.println("[EMAIL] ✗ Error enviando");
   } else {
-    Serial.println("[CORE 0] ✓ Correo enviado correctamente!");
+    Serial.println("[EMAIL] ✓ Enviado correctamente");
   }
   
   smtp.closeSession();
-  Serial.println("=== [CORE 0] FIN ENVIO DE CORREO ===\n");
-}
-
-// --- FUNCIÓN PARA CALIBRAR OFFSET DEL ADC ---
-float calibrateADCOffset(int samples = 1000) {
-  Serial.println("\n[CALIBRACIÓN] Midiendo offset del ADC...");
-  Serial.println("[CALIBRACIÓN] Asegúrate de que NO haya corriente en el sensor");
-  
-  delay(2000);  // Esperar 2 segundos
-  
-  long sum = 0;
-  for(int i = 0; i < samples; i++) {
-    sum += analogRead(CURRENT_SENSOR_PIN);
-    delayMicroseconds(100);
-  }
-  
-  float offset = sum / (float)samples;
-  Serial.printf("[CALIBRACIÓN] Offset calculado: %.2f (de 4095)\n", offset);
-  Serial.printf("[CALIBRACIÓN] Voltaje offset: %.3fV\n", (offset / 4095.0) * 3.3);
-  
-  return offset;
-}
-
-// --- FUNCIÓN MEJORADA PARA LEER CORRIENTE ---
-float readCurrent() {
-  // Leer corriente RMS
-  double Irms = emon1.calcIrms(1480);
-  
-  // Aplicar umbral de ruido
-  if (Irms < NOISE_THRESHOLD) {
-    return 0.0;
-  }
-  
-  return Irms;
-}
-void sendDataToFlask(const char* sensor_name, float value, const char* unit) {
-  if(WiFi.status() == WL_CONNECTED){
-    HTTPClient http;
-    http.begin(serverUrl);
-    http.addHeader("Content-Type", "application/json");
-
-    StaticJsonDocument<200> doc;
-    doc["sensor"] = sensor_name;
-    doc["value"] = value;
-    doc["unit"] = unit;
-    
-    String requestBody;
-    serializeJson(doc, requestBody);
-
-    int httpResponseCode = http.POST(requestBody);
-
-    Serial.printf("[CORE 1] Enviando %s (%.2f %s). HTTP: %d\n", sensor_name, value, unit, httpResponseCode);
-    
-    if (httpResponseCode >= 400) {
-      Serial.println("[CORE 1] Error en respuesta: ");
-      Serial.println(http.getString());
-    }
-    
-    http.end();
-  } else {
-    Serial.println("[CORE 1] ERR: WiFi desconectado");
-  }
 }
 
 // ============================================
-// TAREA 1: ENVÍO DE CORREOS (NÚCLEO 0)
+// TAREA: EMAIL (NÚCLEO 0)
 // ============================================
 void emailTask(void * parameter) {
-  Serial.println("[CORE 0] Tarea de Email iniciada");
+  Serial.println("[CORE 0] Tarea Email iniciada");
   
   EmailAlert alert;
   
   for(;;) {
-    // Esperar por alertas en la cola
     if(xQueueReceive(emailQueue, &alert, portMAX_DELAY)) {
-      Serial.printf("[CORE 0] Alerta recibida: %s = %.2f %s\n", alert.sensor, alert.value, alert.unit);
+      Serial.printf("[CORE 0] Alerta recibida: %s = %.2f %s\n", 
+                    alert.sensor, alert.value, alert.unit);
+      
+      // Enviar email
       sendAlertEmail(alert.sensor, alert.value, alert.unit, alert.threshold);
       
-      // Pequeña pausa después de enviar
+      // También publicar alerta vía MQTT
+      StaticJsonDocument<200> doc;
+      doc["sensor"] = alert.sensor;
+      doc["value"] = alert.value;
+      doc["unit"] = alert.unit;
+      doc["threshold"] = alert.threshold;
+      doc["timestamp"] = millis();
+      
+      char buffer[256];
+      serializeJson(doc, buffer);
+      mqttClient.publish(topic_alerts, buffer, true);
+      
       vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
   }
 }
 
 // ============================================
-// TAREA 2: LECTURA Y ENVÍO A FLASK (NÚCLEO 1)
+// TAREA: SENSORES Y MQTT (NÚCLEO 1)
 // ============================================
-void sensorAndFlaskTask(void * parameter) {
-  Serial.println("[CORE 1] Tarea de Sensores y Flask iniciada");
+void sensorAndMqttTask(void * parameter) {
+  Serial.println("[CORE 1] Tarea Sensores y MQTT iniciada");
   
   unsigned long previousMillis = 0;
-  const long interval = 2000;
+  unsigned long previousStatusMillis = 0;
+  const long interval = 2000;        // Leer cada 2s
+  const long statusInterval = 30000; // Estado cada 30s
   
   for(;;) {
     unsigned long currentMillis = millis();
     
+    // Mantener conexión MQTT
+    if (!mqttClient.connected()) {
+      reconnectMQTT();
+    }
+    mqttClient.loop(); // Procesar mensajes MQTT
+    
+    // === LECTURA DE SENSORES ===
     if (currentMillis - previousMillis >= interval) {
       previousMillis = currentMillis;
       
-      // === LECTURA DE SENSORES ===
       sensors.requestTemperatures();
       float tempC = sensors.getTempCByIndex(0);
-      
-      // Usar función mejorada para leer corriente
       float Irms = readCurrent();
       
-      // Debug: mostrar lectura cruda del ADC cada 10 lecturas
+      // Debug cada 10 lecturas
       static int debugCounter = 0;
       if(debugCounter++ % 10 == 0) {
         int rawADC = analogRead(CURRENT_SENSOR_PIN);
-        Serial.printf("[DEBUG] ADC Raw: %d, Offset: %.0f, Corriente: %.3fA\n", 
-                      rawADC, adcOffset, Irms);
+        Serial.printf("[DEBUG] ADC Raw: %d, Corriente: %.3fA\n", rawADC, Irms);
       }
       
-      // Actualizar variables compartidas de forma segura
+      // Actualizar variables compartidas
       if(xSemaphoreTake(xMutex, portMAX_DELAY)) {
         currentTemp = tempC;
         currentCurrent = Irms;
@@ -275,20 +394,21 @@ void sensorAndFlaskTask(void * parameter) {
           EmailAlert alert;
           
           if (isTempAlert) {
-            Serial.printf("\n[CORE 1] ⚠ ALERTA: Temperatura %.2f°C > %.2f°C\n", tempC, TEMP_THRESHOLD);
+            Serial.printf("\n[ALERTA] Temperatura %.2f°C > %.2f°C\n", 
+                         tempC, TEMP_THRESHOLD);
             strcpy(alert.sensor, "Temperature_01");
             alert.value = tempC;
             strcpy(alert.unit, "C");
             alert.threshold = TEMP_THRESHOLD;
           } else if (isCurrentAlert) {
-            Serial.printf("\n[CORE 1] ⚠ ALERTA: Corriente %.2fA > %.2fA\n", Irms, CURRENT_THRESHOLD);
+            Serial.printf("\n[ALERTA] Corriente %.2fA > %.2fA\n", 
+                         Irms, CURRENT_THRESHOLD);
             strcpy(alert.sensor, "Current_01");
             alert.value = Irms;
             strcpy(alert.unit, "A");
             alert.threshold = CURRENT_THRESHOLD;
           }
           
-          // Enviar alerta a la cola (para el núcleo 0)
           xQueueSend(emailQueue, &alert, portMAX_DELAY);
           emailSent = true;
         }
@@ -296,14 +416,19 @@ void sensorAndFlaskTask(void * parameter) {
         emailSent = false;
       }
       
-      // === ENVÍO A FLASK ===
-      if(tempC != -127.00) { 
-        sendDataToFlask("Temperature_01", tempC, "C");
+      // === PUBLICAR VÍA MQTT ===
+      if(tempC != -127.00) {
+        publishSensorData(topic_temperature, "Temperature_01", tempC, "C");
       }
-      sendDataToFlask("Current_01", Irms, "A");
+      publishSensorData(topic_current, "Current_01", Irms, "A");
     }
     
-    // Pequeña pausa para no saturar el núcleo
+    // === PUBLICAR ESTADO PERIÓDICO ===
+    if (currentMillis - previousStatusMillis >= statusInterval) {
+      previousStatusMillis = currentMillis;
+      publishStatus();
+    }
+    
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
@@ -315,72 +440,63 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n\n=== INICIANDO ESP32 DUAL CORE ===");
+  Serial.println("\n\n=== ESP32 DUAL CORE - MQTT VERSION ===");
   
-  // Crear mutex
+  // Crear mutex y cola
   xMutex = xSemaphoreCreateMutex();
-  
-  // Crear cola para alertas de email (máximo 5 alertas en cola)
   emailQueue = xQueueCreate(5, sizeof(EmailAlert));
   
   // Conectar WiFi
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\n✓ WiFi Conectado!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  setupWiFi();
+  
+  // Configurar MQTT
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(512); // Aumentar buffer si es necesario
   
   // Configurar sensores
-  analogReadResolution(12); 
-  analogSetAttenuation(ADC_11db);  // Rango completo 0-3.3V
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   sensors.begin();
   
-  // CALIBRAR OFFSET DEL ADC
   adcOffset = calibrateADCOffset(1000);
-  
   emon1.current(CURRENT_SENSOR_PIN, CALIBRATION_FACTOR);
   
-  Serial.println("✓ Sensores inicializados y calibrados");
+  Serial.println("✓ Sensores inicializados");
   
-  // === CREAR TAREAS EN NÚCLEOS ESPECÍFICOS ===
+  // Conectar MQTT
+  reconnectMQTT();
   
-  // TAREA 1: Email en NÚCLEO 0 (PRO_CPU)
+  // === CREAR TAREAS ===
   xTaskCreatePinnedToCore(
-    emailTask,           // Función de la tarea
-    "EmailTask",         // Nombre
-    10000,               // Stack size (aumentado para correos)
-    NULL,                // Parámetros
-    1,                   // Prioridad
-    NULL,                // Handle
-    0                    // Núcleo 0 (PRO_CPU)
+    emailTask,
+    "EmailTask",
+    10000,
+    NULL,
+    1,
+    NULL,
+    0  // Núcleo 0
   );
   
-  // TAREA 2: Sensores y Flask en NÚCLEO 1 (APP_CPU)
   xTaskCreatePinnedToCore(
-    sensorAndFlaskTask,  // Función de la tarea
-    "SensorFlaskTask",   // Nombre
-    8000,                // Stack size
-    NULL,                // Parámetros
-    1,                   // Prioridad
-    NULL,                // Handle
-    1                    // Núcleo 1 (APP_CPU)
+    sensorAndMqttTask,
+    "SensorMqttTask",
+    8000,
+    NULL,
+    1,
+    NULL,
+    1  // Núcleo 1
   );
   
-  Serial.println("✓ Tareas creadas en ambos núcleos");
-  Serial.println("  - NÚCLEO 0: Envío de correos");
-  Serial.println("  - NÚCLEO 1: Sensores y Flask");
+  Serial.println("✓ Tareas creadas:");
+  Serial.println("  - NÚCLEO 0: Email");
+  Serial.println("  - NÚCLEO 1: Sensores y MQTT");
   Serial.println("======================\n");
 }
 
 // ============================================
-// LOOP (Ya no se usa, las tareas se encargan)
+// LOOP
 // ============================================
 void loop() {
-  // El loop principal ya no hace nada
-  // Todo está manejado por las tareas FreeRTOS
   vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
